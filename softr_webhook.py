@@ -1,5 +1,5 @@
 """
-Invoice Extractor API for Softr Integration - WITH PDF SUPPORT
+Invoice Extractor API for Softr Integration - PDF SUPPORT
 This API receives invoice uploads from Softr and extracts data to Airtable
 """
 
@@ -31,57 +31,63 @@ airtable_table = airtable_api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
 
 
 def pdf_to_image(pdf_path):
-    """Convert first page of PDF to image"""
+    """Convert first page of PDF to image using PyMuPDF"""
     try:
         import fitz  # PyMuPDF
         
+        print(f"📄 Opening PDF: {pdf_path}")
+        
         # Open PDF
         pdf_document = fitz.open(pdf_path)
+        
+        if pdf_document.page_count == 0:
+            raise Exception("PDF has no pages")
+        
+        print(f"📊 PDF has {pdf_document.page_count} page(s)")
         
         # Get first page
         page = pdf_document[0]
         
         # Render page to image (higher DPI for better quality)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom = 144 DPI
+        # Matrix(2, 2) means 2x zoom = 144 DPI
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat)
         
-        # Convert to PIL Image
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        print(f"📐 Rendered image: {pix.width}x{pix.height} pixels")
+        
+        # Convert to PNG bytes
+        img_bytes = pix.tobytes("png")
         
         # Save as temporary PNG
         img_path = pdf_path.replace('.pdf', '.png')
-        img.save(img_path, 'PNG')
+        with open(img_path, 'wb') as f:
+            f.write(img_bytes)
         
         pdf_document.close()
         
+        print(f"✅ PDF converted successfully: {img_path}")
         return img_path
-    except ImportError:
-        # If PyMuPDF not available, try pdf2image
-        from pdf2image import convert_from_path
         
-        # Convert first page
-        images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
-        
-        # Save first page
-        img_path = pdf_path.replace('.pdf', '.png')
-        images[0].save(img_path, 'PNG')
-        
-        return img_path
+    except ImportError as e:
+        print(f"❌ PyMuPDF (fitz) not found: {e}")
+        raise Exception("PDF processing library not installed. Please contact administrator.")
+    except Exception as e:
+        print(f"❌ PDF conversion failed: {e}")
+        raise Exception(f"Failed to convert PDF: {str(e)}")
 
 
 def extract_invoice_data(file_path):
     """Extract data from invoice using OpenAI Vision - supports images and PDFs"""
     
+    original_path = file_path
+    
     # Check if file is PDF
     if file_path.lower().endswith('.pdf'):
         print("📄 PDF detected - converting to image...")
-        try:
-            file_path = pdf_to_image(file_path)
-            print(f"✅ PDF converted to image: {file_path}")
-        except Exception as e:
-            print(f"⚠️ PDF conversion failed: {e}")
-            raise Exception(f"Failed to convert PDF: {str(e)}")
+        file_path = pdf_to_image(file_path)
     
     # Read and encode image
+    print(f"📖 Reading file: {file_path}")
     with open(file_path, "rb") as image_file:
         image_data = image_file.read()
         base64_image = base64.b64encode(image_data).decode('utf-8')
@@ -95,7 +101,7 @@ def extract_invoice_data(file_path):
         'gif': 'image/gif',
         'webp': 'image/webp'
     }
-    mime_type = mime_type_map.get(file_ext, 'image/jpeg')
+    mime_type = mime_type_map.get(file_ext, 'image/png')
     
     print(f"📤 Sending to OpenAI - Type: {mime_type}, Size: {len(image_data)} bytes")
     
@@ -145,6 +151,8 @@ def extract_invoice_data(file_path):
     
     # Parse response
     content = response.choices[0].message.content
+    print(f"🤖 OpenAI response received: {len(content)} chars")
+    
     if "```json" in content:
         content = content.split("```json")[1].split("```")[0]
     elif "```" in content:
@@ -180,6 +188,8 @@ def save_to_airtable(invoice_data):
     # Remove None values
     record = {k: v for k, v in record.items() if v is not None}
     
+    print(f"💾 Creating Airtable record with {len(record)} fields")
+    
     # Create in Airtable
     created_record = airtable_table.create(record)
     return created_record
@@ -191,7 +201,7 @@ def home():
     return jsonify({
         "status": "active",
         "message": "Invoice Extractor API for Softr - PDF Support Enabled",
-        "version": "2.0",
+        "version": "2.1",
         "supported_formats": ["JPG", "JPEG", "PNG", "PDF"],
         "endpoints": {
             "/webhook": "POST - Receive invoice from Softr",
@@ -206,7 +216,11 @@ def webhook():
     Main endpoint for Softr webhook
     Accepts invoice file and processes it (including PDFs)
     """
+    tmp_path = None
+    png_path = None
+    
     try:
+        print("\n" + "="*60)
         print("📨 Received webhook request")
         
         # Method 1: File upload (multipart/form-data)
@@ -233,6 +247,7 @@ def webhook():
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
                 file.save(tmp.name)
                 tmp_path = tmp.name
+                print(f"💾 Saved to: {tmp_path}")
         
         # Method 2: JSON with file URL (if Softr sends URL)
         elif request.is_json:
@@ -241,6 +256,8 @@ def webhook():
             
             if not file_url:
                 return jsonify({"error": "No file_url provided"}), 400
+            
+            print(f"🔗 Downloading from URL: {file_url}")
             
             # Download file
             import requests
@@ -256,6 +273,7 @@ def webhook():
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
                 tmp.write(response.content)
                 tmp_path = tmp.name
+                print(f"💾 Downloaded to: {tmp_path}")
         
         else:
             return jsonify({"error": "No file provided. Send file or file_url"}), 400
@@ -265,7 +283,7 @@ def webhook():
         # Extract data
         print("🤖 Extracting data with AI...")
         invoice_data = extract_invoice_data(tmp_path)
-        print(f"✅ Extracted: {invoice_data.get('invoice_number')}")
+        print(f"✅ Extracted invoice: {invoice_data.get('invoice_number', 'N/A')}")
         
         # Save to Airtable
         print("💾 Saving to Airtable...")
@@ -273,14 +291,21 @@ def webhook():
         print(f"✅ Saved to Airtable: {airtable_record['id']}")
         
         # Clean up temporary files
+        print("🧹 Cleaning up temporary files...")
         try:
-            os.unlink(tmp_path)
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                print(f"🗑️ Deleted: {tmp_path}")
+            
             # Also clean up converted PNG if it exists
-            png_path = tmp_path.replace('.pdf', '.png')
-            if os.path.exists(png_path):
+            png_path = tmp_path.replace('.pdf', '.png') if tmp_path else None
+            if png_path and os.path.exists(png_path):
                 os.unlink(png_path)
-        except:
-            pass
+                print(f"🗑️ Deleted: {png_path}")
+        except Exception as cleanup_error:
+            print(f"⚠️ Cleanup warning: {cleanup_error}")
+        
+        print("="*60 + "\n")
         
         # Return success
         return jsonify({
@@ -298,6 +323,16 @@ def webhook():
         import traceback
         traceback.print_exc()
         
+        # Clean up on error
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            png_path = tmp_path.replace('.pdf', '.png') if tmp_path else None
+            if png_path and os.path.exists(png_path):
+                os.unlink(png_path)
+        except:
+            pass
+        
         return jsonify({
             "success": False,
             "error": str(e)
@@ -310,15 +345,14 @@ def health():
     
     # Check if PDF libraries are available
     pdf_support = False
+    pdf_library = None
     try:
         import fitz
-        pdf_support = "PyMuPDF"
-    except ImportError:
-        try:
-            import pdf2image
-            pdf_support = "pdf2image"
-        except ImportError:
-            pdf_support = False
+        pdf_support = True
+        pdf_library = f"PyMuPDF {fitz.version[0]}"
+    except ImportError as e:
+        pdf_support = False
+        pdf_library = f"Not installed: {str(e)}"
     
     return jsonify({
         "status": "healthy",
@@ -327,18 +361,27 @@ def health():
         "airtable_configured": bool(AIRTABLE_API_KEY and AIRTABLE_API_KEY != 'your-airtable-token'),
         "base_id": AIRTABLE_BASE_ID if AIRTABLE_BASE_ID != 'your-base-id' else 'not_configured',
         "pdf_support": pdf_support,
+        "pdf_library": pdf_library,
         "supported_formats": ["JPG", "JPEG", "PNG", "PDF", "GIF", "WEBP"]
     })
 
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("🚀 Invoice Extractor API for Softr - PDF SUPPORT")
+    print("🚀 Invoice Extractor API for Softr - PDF SUPPORT v2.1")
     print("="*60)
     print(f"📊 Airtable Base: {AIRTABLE_BASE_ID}")
     print(f"📋 Table: {AIRTABLE_TABLE_NAME}")
+    
+    # Check PDF support
+    try:
+        import fitz
+        print(f"✅ PDF Support: PyMuPDF {fitz.version[0]}")
+    except ImportError:
+        print("⚠️ PDF Support: NOT AVAILABLE (PyMuPDF not installed)")
+    
     print(f"✅ Server running on http://0.0.0.0:5000")
-    print(f"📄 Supported: JPG, PNG, PDF")
+    print(f"📄 Supported formats: JPG, PNG, PDF")
     print("\n📌 Webhook endpoint: POST /webhook")
     print("="*60 + "\n")
     
