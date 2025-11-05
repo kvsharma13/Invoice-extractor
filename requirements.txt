@@ -1,1 +1,7 @@
-
+openai==1.54.3
+pyairtable==2.3.3
+streamlit==1.39.0
+Pillow==10.4.0
+flask==3.0.0
+flask-cors==4.0.0
+requests==2.31.0
