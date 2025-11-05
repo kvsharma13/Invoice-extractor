@@ -1,5 +1,5 @@
 """
-Invoice Extractor API for Softr Integration
+Invoice Extractor API for Softr Integration - WITH PDF SUPPORT
 This API receives invoice uploads from Softr and extracts data to Airtable
 """
 
@@ -12,6 +12,8 @@ from openai import OpenAI
 from pyairtable import Api
 import tempfile
 from datetime import datetime
+from PIL import Image
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -28,12 +30,74 @@ airtable_api = Api(AIRTABLE_API_KEY)
 airtable_table = airtable_api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
 
 
+def pdf_to_image(pdf_path):
+    """Convert first page of PDF to image"""
+    try:
+        import fitz  # PyMuPDF
+        
+        # Open PDF
+        pdf_document = fitz.open(pdf_path)
+        
+        # Get first page
+        page = pdf_document[0]
+        
+        # Render page to image (higher DPI for better quality)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom = 144 DPI
+        
+        # Convert to PIL Image
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Save as temporary PNG
+        img_path = pdf_path.replace('.pdf', '.png')
+        img.save(img_path, 'PNG')
+        
+        pdf_document.close()
+        
+        return img_path
+    except ImportError:
+        # If PyMuPDF not available, try pdf2image
+        from pdf2image import convert_from_path
+        
+        # Convert first page
+        images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
+        
+        # Save first page
+        img_path = pdf_path.replace('.pdf', '.png')
+        images[0].save(img_path, 'PNG')
+        
+        return img_path
+
+
 def extract_invoice_data(file_path):
-    """Extract data from invoice using OpenAI Vision"""
+    """Extract data from invoice using OpenAI Vision - supports images and PDFs"""
+    
+    # Check if file is PDF
+    if file_path.lower().endswith('.pdf'):
+        print("📄 PDF detected - converting to image...")
+        try:
+            file_path = pdf_to_image(file_path)
+            print(f"✅ PDF converted to image: {file_path}")
+        except Exception as e:
+            print(f"⚠️ PDF conversion failed: {e}")
+            raise Exception(f"Failed to convert PDF: {str(e)}")
     
     # Read and encode image
     with open(file_path, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        image_data = image_file.read()
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+    
+    # Detect image type
+    file_ext = file_path.lower().split('.')[-1]
+    mime_type_map = {
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif',
+        'webp': 'image/webp'
+    }
+    mime_type = mime_type_map.get(file_ext, 'image/jpeg')
+    
+    print(f"📤 Sending to OpenAI - Type: {mime_type}, Size: {len(image_data)} bytes")
     
     # Call OpenAI API
     response = openai_client.chat.completions.create(
@@ -70,7 +134,7 @@ def extract_invoice_data(file_path):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+                            "url": f"data:{mime_type};base64,{base64_image}"
                         }
                     }
                 ]
@@ -126,8 +190,9 @@ def home():
     """Health check"""
     return jsonify({
         "status": "active",
-        "message": "Invoice Extractor API for Softr",
-        "version": "1.0",
+        "message": "Invoice Extractor API for Softr - PDF Support Enabled",
+        "version": "2.0",
+        "supported_formats": ["JPG", "JPEG", "PNG", "PDF"],
         "endpoints": {
             "/webhook": "POST - Receive invoice from Softr",
             "/health": "GET - Health check"
@@ -139,7 +204,7 @@ def home():
 def webhook():
     """
     Main endpoint for Softr webhook
-    Accepts invoice file and processes it
+    Accepts invoice file and processes it (including PDFs)
     """
     try:
         print("📨 Received webhook request")
@@ -151,8 +216,20 @@ def webhook():
             if file.filename == '':
                 return jsonify({"error": "No file selected"}), 400
             
-            # Save temporarily
+            # Get file extension
             file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'jpg'
+            
+            # Validate file type
+            allowed_extensions = {'png', 'jpg', 'jpeg', 'pdf', 'gif', 'webp'}
+            if file_ext not in allowed_extensions:
+                return jsonify({
+                    "error": "Invalid file type",
+                    "message": f"Allowed types: {', '.join(allowed_extensions)}"
+                }), 400
+            
+            print(f"📎 File uploaded: {file.filename} (type: {file_ext})")
+            
+            # Save temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
                 file.save(tmp.name)
                 tmp_path = tmp.name
@@ -168,7 +245,15 @@ def webhook():
             # Download file
             import requests
             response = requests.get(file_url)
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+            
+            # Determine file type from URL or content-type
+            content_type = response.headers.get('content-type', '')
+            if 'pdf' in content_type or file_url.lower().endswith('.pdf'):
+                file_ext = 'pdf'
+            else:
+                file_ext = 'jpg'
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
                 tmp.write(response.content)
                 tmp_path = tmp.name
         
@@ -187,8 +272,15 @@ def webhook():
         airtable_record = save_to_airtable(invoice_data)
         print(f"✅ Saved to Airtable: {airtable_record['id']}")
         
-        # Clean up
-        os.unlink(tmp_path)
+        # Clean up temporary files
+        try:
+            os.unlink(tmp_path)
+            # Also clean up converted PNG if it exists
+            png_path = tmp_path.replace('.pdf', '.png')
+            if os.path.exists(png_path):
+                os.unlink(png_path)
+        except:
+            pass
         
         # Return success
         return jsonify({
@@ -203,6 +295,9 @@ def webhook():
     
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
         return jsonify({
             "success": False,
             "error": str(e)
@@ -212,22 +307,38 @@ def webhook():
 @app.route('/health', methods=['GET'])
 def health():
     """Detailed health check"""
+    
+    # Check if PDF libraries are available
+    pdf_support = False
+    try:
+        import fitz
+        pdf_support = "PyMuPDF"
+    except ImportError:
+        try:
+            import pdf2image
+            pdf_support = "pdf2image"
+        except ImportError:
+            pdf_support = False
+    
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "openai_configured": bool(OPENAI_API_KEY and OPENAI_API_KEY != 'your-openai-api-key'),
         "airtable_configured": bool(AIRTABLE_API_KEY and AIRTABLE_API_KEY != 'your-airtable-token'),
-        "base_id": AIRTABLE_BASE_ID if AIRTABLE_BASE_ID != 'your-base-id' else 'not_configured'
+        "base_id": AIRTABLE_BASE_ID if AIRTABLE_BASE_ID != 'your-base-id' else 'not_configured',
+        "pdf_support": pdf_support,
+        "supported_formats": ["JPG", "JPEG", "PNG", "PDF", "GIF", "WEBP"]
     })
 
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("🚀 Invoice Extractor API for Softr")
+    print("🚀 Invoice Extractor API for Softr - PDF SUPPORT")
     print("="*60)
     print(f"📊 Airtable Base: {AIRTABLE_BASE_ID}")
     print(f"📋 Table: {AIRTABLE_TABLE_NAME}")
     print(f"✅ Server running on http://0.0.0.0:5000")
+    print(f"📄 Supported: JPG, PNG, PDF")
     print("\n📌 Webhook endpoint: POST /webhook")
     print("="*60 + "\n")
     
