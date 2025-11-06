@@ -22,7 +22,7 @@ CORS(app)
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'your-openai-api-key')
 AIRTABLE_API_KEY = os.getenv('AIRTABLE_API_KEY', 'your-airtable-token')
 AIRTABLE_BASE_ID = os.getenv('AIRTABLE_BASE_ID', 'your-base-id')
-AIRTABLE_TABLE_NAME = os.getenv('AIRTABLE_TABLE_NAME', 'Invoices')
+AIRTABLE_TABLE_NAME = os.getenv('AIRTABLE_TABLE_NAME', 'Invoice')
 
 # Initialize clients
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
