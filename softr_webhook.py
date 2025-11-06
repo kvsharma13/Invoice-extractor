@@ -1,6 +1,6 @@
 # app.py
 """
-Invoice Extractor API for Softr Integration – PDF & image support.
+Invoice Extractor API for HTML UI & Softr Integration – PDF & image support.
 This API receives invoice uploads (file or URL) and extracts data to Airtable.
 """
 
@@ -15,9 +15,6 @@ import tempfile
 import threading
 import requests
 from datetime import datetime
-# If you use PIL/Image etc you already had imported
-# from PIL import Image
-# import io
 
 app = Flask(__name__)
 CORS(app)
@@ -132,7 +129,7 @@ Return ONLY valid JSON. Use null for missing fields."""
 
 def save_to_airtable(invoice_data, source_file_url=None):
     """Save extracted data to Airtable."""
-    # Prepare line items text as you had
+    # Prepare line items text
     line_items = invoice_data.get("line_items", [])
     items_text = "\n".join([
         f"{itm.get('description','')} – Qty: {itm.get('quantity',0)} × {itm.get('unit_price',0)} = {itm.get('amount',0)}"
@@ -158,7 +155,7 @@ def save_to_airtable(invoice_data, source_file_url=None):
 
     # Filter out None values
     record = {k:v for k,v in record.items() if v is not None}
-    print(f"💾 Writing to Airtable: {record}")
+    print(f"💾 Writing to Airtable with {len(record)} fields")
     created = airtable_table.create(record)
     return created
 
@@ -173,7 +170,6 @@ def process_background(file_path=None, file_url=None):
             print(f"⬇️ Downloading invoice from URL: {file_url}")
             r = requests.get(file_url, timeout=30)
             r.raise_for_status()
-            # Decide file extension
             ext = 'pdf' if ('pdf' in r.headers.get('content-type','') or file_url.lower().endswith('.pdf')) else 'jpg'
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
                 tmp.write(r.content)
@@ -195,66 +191,175 @@ def process_background(file_path=None, file_url=None):
 
     except Exception as e:
         print(f"❌ Error during processing: {e}")
-        # optionally write error to Airtable for manual review
     finally:
         # cleanup tmp file
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            png_path = tmp_path.replace('.pdf', '.png') if tmp_path else None
+            if png_path and os.path.exists(png_path):
+                os.unlink(png_path)
         except Exception as cleanup_err:
             print(f"⚠️ Cleanup error: {cleanup_err}")
 
-@app.route('/softr-webhook', methods=['POST'])
-def softr_webhook():
-    """Endpoint for Softr form to POST invoice file or URL."""
-    try:
-        print("\n" + "="*40)
-        print("📨 Received Softr webhook")
-        payload = None
+@app.route('/')
+def home():
+    """Home page"""
+    return jsonify({
+        "status": "active",
+        "message": "Invoice Extractor API - HTML UI & Softr",
+        "version": "3.0",
+        "supported_formats": ["JPG", "JPEG", "PNG", "PDF"],
+        "endpoints": {
+            "/webhook": "POST - For HTML UI (sync response)",
+            "/softr-webhook": "POST - For Softr (async)", 
+            "/health": "GET - Health check"
+        }
+    })
 
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Main endpoint for HTML UI - processes synchronously"""
+    tmp_path = None
+    png_path = None
+    
+    try:
+        print("\n" + "="*60)
+        print("📨 /webhook called from HTML UI")
+        
         # Handle file upload
         if 'file' in request.files:
             file = request.files['file']
+            
             if file.filename == '':
-                return jsonify({"error": "No file provided"}), 400
+                return jsonify({"error": "No file selected"}), 400
+            
+            ext = file.filename.rsplit('.',1)[1].lower() if '.' in file.filename else 'jpg'
+            
+            # Validate
+            allowed = {'pdf','jpg','jpeg','png','gif','webp'}
+            if ext not in allowed:
+                return jsonify({"error": f"Invalid type. Allowed: {', '.join(allowed)}"}), 400
+            
+            print(f"📎 File: {file.filename} ({ext})")
+            
+            # Save temp
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+                file.save(tmp.name)
+                tmp_path = tmp.name
+            
+            # Extract NOW (synchronous)
+            print("🤖 Extracting...")
+            invoice_data = extract_invoice_data(tmp_path)
+            
+            # Save NOW
+            print("💾 Saving to Airtable...")
+            airtable_record = save_to_airtable(invoice_data)
+            
+            # Cleanup
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                png_path = tmp_path.replace('.pdf', '.png')
+                if png_path and os.path.exists(png_path):
+                    os.unlink(png_path)
+            except:
+                pass
+            
+            print("✅ Done!")
+            print("="*60 + "\n")
+            
+            # Return data to HTML UI
+            return jsonify({
+                "success": True,
+                "message": "Invoice processed successfully",
+                "invoice_number": invoice_data.get("invoice_number"),
+                "total_amount": invoice_data.get("total_amount"),
+                "currency": invoice_data.get("currency"),
+                "airtable_record_id": airtable_record['id'],
+                "data": invoice_data
+            }), 200
+
+        # Handle URL
+        elif request.is_json:
+            data = request.get_json()
+            file_url = data.get('file_url') or data.get('fileUrl')
+            
+            if not file_url:
+                return jsonify({"error": "No file_url"}), 400
+            
+            # Background for URLs
+            threading.Thread(target=process_background, args=(None, file_url)).start()
+            
+            return jsonify({
+                "success": True,
+                "message": "Processing..."
+            }), 202
+        
+        else:
+            return jsonify({"error": "No file provided"}), 400
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        
+        # Cleanup on error
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            png_path = tmp_path.replace('.pdf', '.png') if tmp_path else None
+            if png_path and os.path.exists(png_path):
+                os.unlink(png_path)
+        except:
+            pass
+        
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/softr-webhook', methods=['POST'])
+def softr_webhook():
+    """Endpoint for Softr - background processing"""
+    try:
+        print("\n" + "="*60)
+        print("📨 /softr-webhook called")
+
+        if 'file' in request.files:
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({"error": "No file"}), 400
+            
             ext = file.filename.rsplit('.',1)[1].lower() if '.' in file.filename else 'jpg'
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
                 file.save(tmp.name)
                 file_path = tmp.name
-            print(f"💾 Uploaded file saved: {file_path}")
-            # Launch background
+            
             threading.Thread(target=process_background, args=(file_path, None)).start()
 
-        # Handle JSON with file URL
         elif request.is_json:
             data = request.get_json()
-            file_url = data.get('file_url') or data.get('invoice_pdf') or data.get('fileUrl')
+            file_url = data.get('file_url') or data.get('fileUrl')
             if not file_url:
-                return jsonify({"error": "No file_url provided"}), 400
-            print(f"🔗 Received file URL: {file_url}")
+                return jsonify({"error": "No file_url"}), 400
+            
             threading.Thread(target=process_background, args=(None, file_url)).start()
+        
         else:
-            return jsonify({"error": "Invalid request: provide file or file_url"}), 400
+            return jsonify({"error": "Invalid request"}), 400
 
-        # Immediate response
-        return jsonify({
-            "success": True,
-            "message": "Invoice upload received. Extraction in progress."
-        }), 202
+        return jsonify({"success": True, "message": "Processing..."}), 202
 
     except Exception as e:
-        print(f"❌ Webhook error: {e}")
+        print(f"❌ Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
-    import fitz
-    pdf_support = True
+    """Health check"""
+    pdf_support = False
     try:
         import fitz
+        pdf_support = True
     except ImportError:
-        pdf_support = False
+        pass
+    
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
@@ -264,5 +369,8 @@ def health():
     }), 200
 
 if __name__ == "__main__":
-    print("🚀 Invoice Extractor API – Running")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    print("\n🚀 Invoice Extractor API")
+    print(f"📊 Base: {AIRTABLE_BASE_ID}")
+    print(f"📋 Table: {AIRTABLE_TABLE_NAME}\n")
+    
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
